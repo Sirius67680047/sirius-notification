@@ -1,40 +1,61 @@
 const admin = require("firebase-admin");
+const cloudinary = require("cloudinary").v2;
 
-// La clé du compte de service Firebase sera stockée dans un "secret" GitHub
-// (pas écrite en clair ici, pour rester sécurisée)
 const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
-
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
 });
-
 const db = admin.firestore();
+
+cloudinary.config(true);
+
+async function uploaderImageBase64(base64String, productId) {
+  try {
+    const dataUri = `data:image/jpeg;base64,${base64String}`;
+    const result = await cloudinary.uploader.upload(dataUri, {
+      folder: "sirius_premium",
+      public_id: productId,
+      overwrite: true,
+    });
+    return result.secure_url;
+  } catch (error) {
+    console.error("Erreur upload Cloudinary pour", productId, ":", error.message);
+    return null;
+  }
+}
 
 async function envoyerNotificationsProduitsPremium() {
   const snapshot = await db
     .collection("products")
     .where("isPremium", "==", true)
-    .where("premiumNotifie", "!=", true)
     .get();
 
-  if (snapshot.empty) {
+  const produitsANotifier = snapshot.docs.filter(doc => doc.data().premiumNotifie !== true);
+
+  if (produitsANotifier.length === 0) {
     console.log("Aucun nouveau produit premium à notifier.");
     return;
   }
 
-  for (const doc of snapshot.docs) {
+  for (const doc of produitsANotifier) {
     const data = doc.data();
+
+    let imageUrl = data.imageUrl;
+    if (!imageUrl && data.imageBase64) {
+      console.log("Upload de l'image vers Cloudinary pour :", doc.id);
+      imageUrl = await uploaderImageBase64(data.imageBase64, doc.id);
+    }
 
     const message = {
       topic: "produits_premium",
       notification: {
         title: `✨ ${data.name || "Nouveau produit"} — ${data.price ? data.price + " FCFA" : ""}`,
         body: `Découvrez ce produit en vedette sur Sirius, à ${data.city || ""}`,
-        imageUrl: data.imageUrl || undefined,
+        imageUrl: imageUrl || undefined,
       },
       android: {
         notification: {
-          imageUrl: data.imageUrl || undefined,
+          imageUrl: imageUrl || undefined,
         },
       },
       data: {
@@ -47,8 +68,10 @@ async function envoyerNotificationsProduitsPremium() {
       await admin.messaging().send(message);
       console.log("Notification envoyée pour :", doc.id);
 
-      // On marque le produit comme déjà notifié pour ne pas le renvoyer au prochain passage
-      await doc.ref.update({ premiumNotifie: true });
+      await doc.ref.update({
+        premiumNotifie: true,
+        imageUrl: imageUrl || null,
+      });
     } catch (error) {
       console.error("Erreur d'envoi pour", doc.id, ":", error);
     }
@@ -59,15 +82,16 @@ async function envoyerNotificationsNouvellesCommandes() {
   const snapshot = await db
     .collection("orders")
     .where("status", "==", "enAttenteLocalisation")
-    .where("vendeurNotifie", "!=", true)
     .get();
 
-  if (snapshot.empty) {
+  const commandesANotifier = snapshot.docs.filter(doc => doc.data().vendeurNotifie !== true);
+
+  if (commandesANotifier.length === 0) {
     console.log("Aucune nouvelle commande à notifier.");
     return;
   }
 
-  for (const doc of snapshot.docs) {
+  for (const doc of commandesANotifier) {
     const commande = doc.data();
     const sellerId = commande.sellerId;
 
